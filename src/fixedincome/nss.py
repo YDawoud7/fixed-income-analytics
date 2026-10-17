@@ -4,7 +4,7 @@
     NSS: y(t) = NS(t) + b3 * L2(t/tau2)
 
 with loadings L1(x) = (1 - e^-x) / x and L2(x) = L1(x) - e^-x.
-b0 is the long-run level, b1 the slope (b0 + b1 is the instantaneous short
+b0 is the long-run level (constrained to be non-negative), b1 the slope (b0 + b1 is the instantaneous short
 rate) and b2/b3 control the humps.
 
 For fixed decay parameters the model is linear in the betas, so fitting
@@ -22,6 +22,10 @@ import numpy as np
 from scipy.optimize import least_squares
 
 TAU_BOUNDS = (0.05, 30.0)
+# Minimum tau2 / tau1 ratio for Svensson. When the two decay parameters get
+# close the hump loadings become collinear and b2, b3 blow up in opposite
+# directions while barely improving the fit.
+MIN_TAU_RATIO = 1.5
 
 
 def _l1(x: np.ndarray) -> np.ndarray:
@@ -80,13 +84,17 @@ def _grid_search(t, y, w, n_taus: int):
     grid = np.geomspace(0.2, 15.0, 25)
     best = None
     for taus in product(grid, repeat=n_taus):
-        if n_taus == 2 and taus[1] <= taus[0] * 1.2:
-            continue  # keep humps distinct so the design stays well conditioned
+        if n_taus == 2 and taus[1] < taus[0] * MIN_TAU_RATIO:
+            continue
         X = _design(t, taus)
         betas, *_ = np.linalg.lstsq(X * w[:, None], y * w, rcond=None)
+        if betas[0] < 0:
+            continue  # a negative long-run level is not economically meaningful
         sse = float(np.sum((w * (X @ betas - y)) ** 2))
         if best is None or sse < best[0]:
             best = (sse, betas, taus)
+    if best is None:
+        raise ValueError("no admissible starting point found")
     return best[1], best[2]
 
 
@@ -98,20 +106,32 @@ def _fit(t, y, weights, n_taus: int):
         raise ValueError("not enough points to fit the model")
 
     betas, taus = _grid_search(t, y, w, n_taus)
-    x0 = np.concatenate([betas, taus])
     n_b = len(betas)
-    lo = np.r_[np.full(n_b, -np.inf), np.full(n_taus, TAU_BOUNDS[0])]
-    hi = np.r_[np.full(n_b, np.inf), np.full(n_taus, TAU_BOUNDS[1])]
 
-    def resid(p):
-        X = _design(t, tuple(p[n_b:]))
-        return w * (X @ p[:n_b] - y)
+    # Optimise over (betas, tau1[, tau2 / tau1]) so the ratio bound is a box constraint.
+    def unpack(q):
+        if n_taus == 1:
+            return q[:n_b], (q[n_b],)
+        return q[:n_b], (q[n_b], q[n_b] * q[n_b + 1])
+
+    if n_taus == 1:
+        x0 = np.r_[betas, taus[0]]
+        lo = np.r_[0.0, np.full(n_b - 1, -np.inf), TAU_BOUNDS[0]]
+        hi = np.r_[np.full(n_b, np.inf), TAU_BOUNDS[1]]
+    else:
+        x0 = np.r_[betas, taus[0], taus[1] / taus[0]]
+        lo = np.r_[0.0, np.full(n_b - 1, -np.inf), TAU_BOUNDS[0], MIN_TAU_RATIO]
+        hi = np.r_[np.full(n_b, np.inf), TAU_BOUNDS[1], TAU_BOUNDS[1] / TAU_BOUNDS[0]]
+
+    def resid(q):
+        b, tt = unpack(q)
+        return w * (_design(t, tt) @ b - y)
 
     sol = least_squares(resid, x0, bounds=(lo, hi), xtol=1e-15, ftol=1e-15, gtol=1e-15, max_nfev=20000)
-    p = sol.x
-    fitted = _design(t, tuple(p[n_b:])) @ p[:n_b]
+    b, tt = unpack(sol.x)
+    fitted = _design(t, tt) @ b
     rmse = float(np.sqrt(np.mean((fitted - y) ** 2)))
-    return p, rmse
+    return np.r_[b, tt], rmse
 
 
 def fit_nelson_siegel(t, y, weights=None) -> NSParams:
