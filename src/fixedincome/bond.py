@@ -81,3 +81,39 @@ class FixedRateBond:
             return self.dirty_price(y, settlement) - target
 
         return float(brentq(f, -0.99 * self.frequency, 10.0, xtol=1e-14, maxiter=500))
+
+    # ------------------------------------------------------------------
+    # Risk measures. Times are in years, t_k = (w + k) / f.
+    # ------------------------------------------------------------------
+
+    def macaulay_duration(self, yld: float, settlement: date) -> float:
+        periods, amounts = self._times_and_flows(settlement)
+        pv = amounts * (1 + yld / self.frequency) ** -periods
+        t = periods / self.frequency
+        return float(np.sum(t * pv) / np.sum(pv))
+
+    def modified_duration(self, yld: float, settlement: date) -> float:
+        return self.macaulay_duration(yld, settlement) / (1 + yld / self.frequency)
+
+    def convexity(self, yld: float, settlement: date) -> float:
+        """Second derivative of the dirty price w.r.t. yield, divided by price."""
+        f = self.frequency
+        periods, amounts = self._times_and_flows(settlement)
+        pv = amounts * (1 + yld / f) ** -periods
+        return float(np.sum(pv * periods * (periods + 1)) / (np.sum(pv) * f**2 * (1 + yld / f) ** 2))
+
+    def dv01(self, yld: float, settlement: date) -> float:
+        """Dirty price change for a 1bp fall in yield, per 100 face."""
+        return self.modified_duration(yld, settlement) * self.dirty_price(yld, settlement) * 1e-4
+
+    def effective_duration(self, yld: float, settlement: date, bump: float = 1e-4) -> float:
+        """Duration from central finite differences, as a cross-check."""
+        up = self.dirty_price(yld + bump, settlement)
+        down = self.dirty_price(yld - bump, settlement)
+        return (down - up) / (2 * bump * self.dirty_price(yld, settlement))
+
+    def effective_convexity(self, yld: float, settlement: date, bump: float = 1e-4) -> float:
+        p0 = self.dirty_price(yld, settlement)
+        up = self.dirty_price(yld + bump, settlement)
+        down = self.dirty_price(yld - bump, settlement)
+        return (up + down - 2 * p0) / (p0 * bump**2)
